@@ -74,12 +74,25 @@ def _custom_unit_to_cp(s: str, budget: int, len_fn) -> int:
     return lo
 
 
+def _is_tailscale_ip(addr: ipaddress._BaseAddress) -> bool:
+    """Return True if *addr* is within the Tailscale CGNAT range (100.64.0.0/10).
+
+    Tailscale assigns IPs in the 100.64.0.0/10 block (100.64.0.0 - 100.127.255.255).
+    These are treated as private mesh network addresses, not publicly routable.
+    """
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return False
+    # 100.64.0.0/10
+    return 100 << 24 <= int(addr) < 100 << 24 | 64 << 16
+
+
 def is_network_accessible(host: str) -> bool:
     """Return True if *host* would expose the server beyond loopback.
 
     Loopback addresses (127.0.0.1, ::1, IPv4-mapped ::ffff:127.0.0.1)
     are local-only.  Unspecified addresses (0.0.0.0, ::) bind all
-    interfaces.  Hostnames are resolved; DNS failure fails closed.
+    interfaces.  Tailscale IPs (100.64.0.0/10) are treated as private.
+    Hostnames are resolved; DNS failure fails closed.
     """
     try:
         addr = ipaddress.ip_address(host)
@@ -88,6 +101,9 @@ def is_network_accessible(host: str) -> bool:
         # ::ffff:127.0.0.1 — Python reports is_loopback=False for mapped
         # addresses, so check the underlying IPv4 explicitly.
         if getattr(addr, "ipv4_mapped", None) and addr.ipv4_mapped.is_loopback:
+            return False
+        # Tailscale CGNAT range is treated as private
+        if _is_tailscale_ip(addr):
             return False
         return True
     except ValueError:
@@ -102,7 +118,7 @@ def is_network_accessible(host: str) -> bool:
         # then we consider it to be network accessible
         for _family, _type, _proto, _canonname, sockaddr in resolved:
             addr = ipaddress.ip_address(sockaddr[0])
-            if not addr.is_loopback:
+            if not addr.is_loopback and not _is_tailscale_ip(addr):
                 return True
         return False
     except (_socket.gaierror, OSError):
