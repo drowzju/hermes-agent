@@ -131,3 +131,9 @@ markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
 ]
 addopts = "-m 'not integration' -n auto"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-aiohttp>=1.1.0",
+]

@@ -23,6 +23,7 @@ Requires:
 import asyncio
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -31,7 +32,8 @@ import re
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from aiohttp import web
@@ -57,6 +59,12 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+# File upload settings
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+DEFAULT_FILES_DIR = "api_files"
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+ALLOWED_FILE_TYPES = {"application/pdf", "text/plain", "text/markdown", "application/json"} | ALLOWED_IMAGE_TYPES
 
 
 def _normalize_chat_content(
@@ -98,7 +106,8 @@ def _normalize_chat_content(
                             parts.append(str(text)[:MAX_NORMALIZED_TEXT_LENGTH])
                         except Exception:
                             pass
-                # Silently skip image_url / other non-text parts
+                # image_url and file types are silently skipped for text normalization
+                # They are extracted separately by _extract_content_parts
             elif isinstance(item, list):
                 nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
                 if nested:
@@ -115,6 +124,82 @@ def _normalize_chat_content(
         return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
     except Exception:
         return ""
+
+
+def _extract_content_parts(content: Any) -> List[Dict[str, Any]]:
+    """Extract structured content parts from OpenAI-format content.
+
+    Returns a list of content parts including text, image_url, and file references.
+    This allows the agent to handle multimodal content.
+
+    Example input::
+
+        [
+            {"type": "text", "text": "Check this image:"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+            {"type": "file", "file": {"file_id": "file_123", "filename": "doc.pdf"}},
+        ]
+
+    Returns::
+
+        [
+            {"type": "text", "text": "Check this image:"},
+            {"type": "image_url", "url": "https://example.com/img.png", "detail": "auto"},
+            {"type": "file", "file_id": "file_123", "filename": "doc.pdf"},
+        ]
+    """
+    if content is None:
+        return []
+
+    if isinstance(content, str):
+        if content:
+            return [{"type": "text", "text": content}]
+        return []
+
+    if isinstance(content, list):
+        parts: List[Dict[str, Any]] = []
+        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            item_type = str(item.get("type") or "").strip().lower()
+
+            if item_type in {"text", "input_text", "output_text"}:
+                text = item.get("text", "")
+                if text:
+                    parts.append({"type": "text", "text": str(text)})
+
+            elif item_type == "image_url":
+                image_data = item.get("image_url", {})
+                if isinstance(image_data, dict) and image_data.get("url"):
+                    parts.append({
+                        "type": "image_url",
+                        "url": image_data["url"],
+                        "detail": image_data.get("detail", "auto"),
+                    })
+                elif isinstance(image_data, str):
+                    # Some clients send image_url as a plain string
+                    parts.append({
+                        "type": "image_url",
+                        "url": image_data,
+                        "detail": "auto",
+                    })
+
+            elif item_type == "file":
+                file_data = item.get("file", {})
+                if isinstance(file_data, dict):
+                    file_id = file_data.get("file_id") or file_data.get("id")
+                    if file_id:
+                        parts.append({
+                            "type": "file",
+                            "file_id": file_id,
+                            "filename": file_data.get("filename", ""),
+                        })
+
+        return parts
+
+    return []
 
 
 def check_api_server_requirements() -> bool:
@@ -395,6 +480,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Pending exec approvals for API clients: approval_id -> approval_data
+        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._approval_counter = itertools.count(1)
+        # Approved/denied approval history (for reference)
+        self._approval_history: Dict[str, Dict[str, Any]] = {}
+        # Files storage for uploads: file_id -> file_metadata
+        self._files_dir: str = self._init_files_dir(extra.get("files_dir"), config)
+        self._file_counter = itertools.count(1)
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -430,6 +523,30 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return "hermes-agent"
+
+    def _init_files_dir(self, explicit_dir: Optional[str], config: Any) -> str:
+        """Initialize and return the files storage directory.
+
+        Priority:
+        1. Explicit directory from config extra
+        2. API_SERVER_FILES_DIR env var
+        3. ~/.hermes/api_files default
+        """
+        from pathlib import Path
+        from hermes_constants import get_hermes_home
+
+        if explicit_dir:
+            files_dir = Path(explicit_dir)
+        else:
+            env_dir = os.getenv("API_SERVER_FILES_DIR")
+            if env_dir:
+                files_dir = Path(env_dir)
+            else:
+                hermes_home = get_hermes_home()
+                files_dir = hermes_home / DEFAULT_FILES_DIR
+
+        files_dir.mkdir(parents=True, exist_ok=True)
+        return str(files_dir)
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -557,6 +674,362 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
         )
         return agent
+
+    # ------------------------------------------------------------------
+    # Exec Approval Support
+    # ------------------------------------------------------------------
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """
+        Store an exec approval request for API clients to poll and resolve.
+        Called by gateway/run.py when dangerous command detected.
+        """
+        approval_id = f"api_{next(self._approval_counter)}"
+        self._pending_approvals[approval_id] = {
+            "id": approval_id,
+            "chat_id": chat_id,
+            "command": command,
+            "session_key": session_key,
+            "description": description,
+            "metadata": metadata or {},
+            "created_at": time.time(),
+            "status": "pending",
+        }
+        logger.debug("[APIServer] Exec approval created: %s", approval_id)
+        return SendResult(success=True, message_id=approval_id)
+
+    async def _handle_approvals_list(self, request: "web.Request") -> "web.Response":
+        """GET /v1/approvals/pending — list pending approvals for the session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        # Get session_id from query param or header
+        session_key = request.query.get("session_key") or request.headers.get("X-Hermes-Session-Key", "")
+
+        # Filter approvals by session_key if provided
+        approvals = []
+        for approval in self._pending_approvals.values():
+            if approval["status"] == "pending":
+                if not session_key or approval.get("session_key") == session_key:
+                    approvals.append({
+                        "id": approval["id"],
+                        "command": approval["command"],
+                        "session_key": approval.get("session_key"),
+                        "description": approval.get("description"),
+                        "created_at": approval.get("created_at"),
+                        "status": approval["status"],
+                    })
+
+        return web.json_response({"approvals": approvals})
+
+    async def _handle_approval_resolve(self, request: "web.Request") -> "web.Response":
+        """POST /v1/approvals/{approval_id}/resolve — resolve an approval request."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        approval_id = request.match_info.get("approval_id", "")
+        if not approval_id or approval_id not in self._pending_approvals:
+            return web.json_response(
+                {"error": {"message": "Approval not found", "type": "not_found"}},
+                status=404,
+            )
+
+        approval = self._pending_approvals[approval_id]
+        if approval["status"] != "pending":
+            return web.json_response(
+                {"error": {"message": "Approval already resolved", "type": "already_resolved"}},
+                status=409,
+            )
+
+        try:
+            body = await request.json()
+            decision = body.get("decision", "")
+        except Exception:
+            return web.json_response(
+                {"error": {"message": "Invalid JSON body", "type": "invalid_request"}},
+                status=400,
+            )
+
+        if decision not in ("allow-once", "allow-session", "allow-always", "deny"):
+            return web.json_response(
+                {"error": {"message": "Invalid decision. Must be: allow-once, allow-session, allow-always, deny", "type": "invalid_decision"}},
+                status=400,
+            )
+
+        # Update approval status
+        approval["status"] = decision
+        approval["resolved_at"] = time.time()
+
+        # Move to history
+        self._approval_history[approval_id] = approval
+        del self._pending_approvals[approval_id]
+
+        # Call resolve_gateway_approval to unblock the agent
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(approval["session_key"], decision)
+            logger.debug("[APIServer] Approval %s resolved with %s, unblocked %d waiter(s)",
+                        approval_id, decision, count)
+        except Exception as e:
+            logger.warning("[APIServer] Failed to resolve gateway approval: %s", e)
+
+        return web.json_response({
+            "success": True,
+            "approval_id": approval_id,
+            "decision": decision,
+        })
+
+    # ------------------------------------------------------------------
+    # File Upload Handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_files_upload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/files — upload a file."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        # Check Content-Length
+        content_length = request.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_FILE_SIZE:
+            return web.json_response(
+                {"error": {"message": f"File too large (max {MAX_FILE_SIZE} bytes)", "type": "file_too_large"}},
+                status=413,
+            )
+
+        reader = await request.multipart()
+        field = await reader.next()
+
+        if not field or field.name != "file":
+            return web.json_response(
+                {"error": {"message": "Missing 'file' field", "type": "invalid_request"}},
+                status=400,
+            )
+
+        filename = field.filename or "unnamed"
+        content_type = field.headers.get("Content-Type", "application/octet-stream")
+
+        # Read file content
+        try:
+            size = 0
+            chunks = []
+            while chunk := await field.read_chunk():
+                size += len(chunk)
+                if size > MAX_FILE_SIZE:
+                    return web.json_response(
+                        {"error": {"message": f"File too large (max {MAX_FILE_SIZE} bytes)", "type": "file_too_large"}},
+                        status=413,
+                    )
+                chunks.append(chunk)
+            content = b"".join(chunks)
+        except Exception as e:
+            logger.warning("[APIServer] Error reading uploaded file: %s", e)
+            return web.json_response(
+                {"error": {"message": "Error reading file", "type": "read_error"}},
+                status=400,
+            )
+
+        # Generate file ID and save
+        file_id = f"file_{next(self._file_counter)}_{uuid.uuid4().hex[:8]}"
+        file_path = Path(self._files_dir) / file_id
+
+        try:
+            file_path.write_bytes(content)
+        except Exception as e:
+            logger.error("[APIServer] Error saving file: %s", e)
+            return web.json_response(
+                {"error": {"message": "Error saving file", "type": "save_error"}},
+                status=500,
+            )
+
+        # Detect if image
+        is_image = content_type.startswith("image/") or self._is_image_content(content)
+
+        logger.debug("[APIServer] File uploaded: %s (%d bytes, %s)", file_id, size, content_type)
+
+        return web.json_response({
+            "id": file_id,
+            "filename": filename,
+            "bytes": size,
+            "mime_type": content_type,
+            "is_image": is_image,
+            "created_at": time.time(),
+        })
+
+    async def _handle_files_get(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/{file_id} — retrieve a file."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        file_id = request.match_info.get("file_id", "")
+
+        # Security: prevent path traversal
+        if "/" in file_id or "\\" in file_id or ".." in file_id:
+            return web.json_response(
+                {"error": {"message": "Invalid file ID", "type": "invalid_request"}},
+                status=400,
+            )
+
+        file_path = Path(self._files_dir) / file_id
+        if not file_path.exists():
+            return web.json_response(
+                {"error": {"message": "File not found", "type": "not_found"}},
+                status=404,
+            )
+
+        # Detect content type
+        content_type = "application/octet-stream"
+        if file_path.suffix == ".png":
+            content_type = "image/png"
+        elif file_path.suffix == ".jpg" or file_path.suffix == ".jpeg":
+            content_type = "image/jpeg"
+        elif file_path.suffix == ".gif":
+            content_type = "image/gif"
+        elif file_path.suffix == ".webp":
+            content_type = "image/webp"
+        elif file_path.suffix == ".txt":
+            content_type = "text/plain"
+        elif file_path.suffix == ".json":
+            content_type = "application/json"
+        elif file_path.suffix == ".pdf":
+            content_type = "application/pdf"
+
+        return web.FileResponse(file_path, headers={"Content-Type": content_type})
+
+    async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/messages — retrieve session message history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        if not session_id:
+            return web.json_response(
+                {"error": {"message": "Missing session_id", "type": "invalid_request"}},
+                status=400,
+            )
+
+        # Parse pagination parameters
+        try:
+            limit = int(request.query.get("limit", "20"))
+            if limit < 1 or limit > 100:
+                limit = 20
+        except (ValueError, TypeError):
+            limit = 20
+
+        before_id = request.query.get("before_id")
+
+        # Retrieve messages from SessionDB
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                {"error": {"message": "Session database unavailable", "type": "service_unavailable"}},
+                status=503,
+            )
+
+        try:
+            messages = db.get_messages_as_conversation(session_id)
+        except Exception as e:
+            logger.warning("[APIServer] Failed to get messages for session %s: %s", session_id, e)
+            return web.json_response(
+                {"error": {"message": "Failed to retrieve messages", "type": "database_error"}},
+                status=500,
+            )
+
+        # Apply pagination: filter by before_id if provided
+        if before_id is not None:
+            try:
+                before_id_int = int(before_id)
+                # Find index of message with id == before_id
+                start_index = None
+                for i, msg in enumerate(messages):
+                    if msg.get("id") == before_id_int:
+                        start_index = i
+                        break
+                if start_index is not None:
+                    messages = messages[:start_index]
+                else:
+                    # before_id not found, return empty
+                    messages = []
+            except (ValueError, TypeError):
+                # Invalid before_id, ignore it
+                pass
+
+        # Apply limit (from the end for "load more" behavior)
+        if len(messages) > limit:
+            messages = messages[-limit:]
+
+        return web.json_response({
+            "messages": messages,
+            "session_id": session_id,
+            "count": len(messages),
+        })
+        if not file_id:
+            return web.json_response(
+                {"error": {"message": "Missing file ID", "type": "invalid_request"}},
+                status=400,
+            )
+
+        # Security: prevent path traversal
+        if "/" in file_id or "\\" in file_id or ".." in file_id:
+            return web.json_response(
+                {"error": {"message": "Invalid file ID", "type": "invalid_request"}},
+                status=400,
+            )
+
+        file_path = Path(self._files_dir) / file_id
+        if not file_path.exists():
+            return web.json_response(
+                {"error": {"message": "File not found", "type": "not_found"}},
+                status=404,
+            )
+
+        # Detect content type
+        content_type = "application/octet-stream"
+        if file_path.suffix == ".png":
+            content_type = "image/png"
+        elif file_path.suffix == ".jpg" or file_path.suffix == ".jpeg":
+            content_type = "image/jpeg"
+        elif file_path.suffix == ".gif":
+            content_type = "image/gif"
+        elif file_path.suffix == ".webp":
+            content_type = "image/webp"
+        elif file_path.suffix == ".txt":
+            content_type = "text/plain"
+        elif file_path.suffix == ".json":
+            content_type = "application/json"
+        elif file_path.suffix == ".pdf":
+            content_type = "application/pdf"
+
+        return web.FileResponse(file_path, headers={"Content-Type": content_type})
+
+    def _is_image_content(self, content: bytes) -> bool:
+        """Detect if content is an image by magic bytes."""
+        if len(content) < 8:
+            return False
+        # PNG
+        if content[:8] == b"\x89PNG\r\n\x1a\n":
+            return True
+        # JPEG
+        if content[:2] == b"\xff\xd8":
+            return True
+        # GIF
+        if content[:6] in (b"GIF87a", b"GIF89a"):
+            return True
+        # WebP
+        if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -1808,6 +2281,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            # Exec approval API
+            self._app.router.add_get("/v1/approvals/pending", self._handle_approvals_list)
+            self._app.router.add_post("/v1/approvals/{approval_id}/resolve", self._handle_approval_resolve)
+            # File upload API
+            self._app.router.add_post("/v1/files", self._handle_files_upload)
+            self._app.router.add_get("/v1/files/{file_id}", self._handle_files_get)
+            # Session messages API
+            self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_session_messages)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
